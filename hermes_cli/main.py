@@ -34,7 +34,7 @@ Usage:
     hermes honcho identity                 # Show AI peer identity representation
     hermes honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
     hermes honcho migrate                  # Step-by-step migration guide: OpenClaw native → Hermes + Honcho
-    hermes version             Show version
+    hermes --version           Show version and update status
     hermes update              Update to latest version
     hermes uninstall           Uninstall Hermes Agent
     hermes acp                 Run as an ACP server for editor integration
@@ -67,6 +67,7 @@ except ModuleNotFoundError:
 # visible console when this process is windowless (pythonw gateway + every
 # kanban worker).  No-op on POSIX; never raises.
 from hermes_cli._subprocess_compat import suppress_platform_ver_console
+from hermes_cli.cli_output import line_input
 
 suppress_platform_ver_console()
 
@@ -179,6 +180,7 @@ def _run_and_exit_oneshot(
     model: object = None,
     provider: object = None,
     toolsets: object = None,
+    skills: object = None,
     usage_file: object = None,
 ) -> None:
     try:
@@ -189,6 +191,7 @@ def _run_and_exit_oneshot(
             model=model,
             provider=provider,
             toolsets=toolsets,
+            skills=skills,
             usage_file=usage_file,
         )
     except KeyboardInterrupt:
@@ -465,7 +468,6 @@ from hermes_cli.subcommands.import_agent import build_import_agent_parser
 from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.skin import build_skin_parser
 from hermes_cli.subcommands.console import build_console_parser
-from hermes_cli.subcommands.version import build_version_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
@@ -3111,22 +3113,50 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch. Runs in a background daemon
-    # thread: the sync is idempotent, hash-gated (unchanged skills are
+    # Sync bundled skills on every CLI launch. Normally runs in a background
+    # daemon thread: the sync is idempotent, hash-gated (unchanged skills are
     # skipped), and nothing on the banner path depends on it, yet the scan
     # alone costs ~120-170ms of rglob/hashing on the startup path. Skill
     # loading happens at agent init (first message), by which point the
-    # sync has long finished; a same-instant race would only matter in the
-    # rare launch right after `hermes update` changed a bundled skill.
+    # sync has long finished.
+    #
+    # FIRST RUN is the exception: with an empty ~/.hermes/skills the banner
+    # prefetch races the background sync, caches an empty skills index, and
+    # the very first launch greets the user with "No skills installed ·
+    # 0 skills" while 69 bundled skills land milliseconds later (full-surface
+    # CLI QA sweep, Aug 2026). Run the sync in the foreground exactly once —
+    # only when the skills dir has no SKILL.md yet — so the first impression
+    # matches reality; every later launch keeps the background path.
+    def _skills_dir_is_unseeded() -> bool:
+        try:
+            from hermes_cli.config import get_hermes_home
+            skills_dir = Path(get_hermes_home()) / "skills"
+            if not skills_dir.is_dir():
+                return True
+            return next(skills_dir.rglob("SKILL.md"), None) is None
+        except Exception:
+            return False
+
     def _skills_sync_bg() -> None:
         try:
             _sync_bundled_skills_for_startup()
         except Exception:
             pass
 
-    threading.Thread(
-        target=_skills_sync_bg, name="bundled-skills-sync", daemon=True
-    ).start()
+    if _skills_dir_is_unseeded():
+        _skills_sync_bg()
+        # The banner prefetch thread (started above) may have scanned the
+        # still-empty dir and cached an empty skills index — drop it so the
+        # banner recomputes against the freshly seeded tree.
+        try:
+            import hermes_cli.banner as _banner_mod
+            _banner_mod._available_skills_cache = None
+        except Exception:
+            pass
+    else:
+        threading.Thread(
+            target=_skills_sync_bg, name="bundled-skills-sync", daemon=True
+        ).start()
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the
@@ -3220,6 +3250,7 @@ def cmd_chat(args):
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
+        "run_budget": getattr(args, "run_budget", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
@@ -3337,11 +3368,11 @@ def cmd_whatsapp(args):
             response = "n"
         if response.lower() in {"y", "yes"}:
             if wa_mode == "bot":
-                phone = input(
+                phone = line_input(
                     "  Phone numbers that can message the bot (comma-separated): "
                 ).strip()
             else:
-                phone = input("  Your phone number (e.g. 15551234567): ").strip()
+                phone = line_input("  Your phone number (e.g. 15551234567): ").strip()
             if phone:
                 save_env_value("WHATSAPP_ALLOWED_USERS", phone.replace(" ", ""))
                 print(f"  ✓ Updated to: {phone}")
@@ -3349,11 +3380,11 @@ def cmd_whatsapp(args):
         print()
         if wa_mode == "bot":
             print("  Who should be allowed to message the bot?")
-            phone = input(
+            phone = line_input(
                 "  Phone numbers (comma-separated, or * for anyone): "
             ).strip()
         else:
-            phone = input("  Your phone number (e.g. 15551234567): ").strip()
+            phone = line_input("  Your phone number (e.g. 15551234567): ").strip()
         if phone:
             save_env_value("WHATSAPP_ALLOWED_USERS", phone.replace(" ", ""))
             print(f"  ✓ Allowed users set: {phone}")
@@ -4407,7 +4438,7 @@ def _aux_flow_provider_model(
         print(f"No curated model list for {provider_slug}.")
         print("Enter a model slug manually (blank = use provider default):")
         try:
-            val = input("Model: ").strip()
+            val = line_input("Model: ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             return
@@ -4448,7 +4479,7 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
         url_prompt = (
             f"Base URL [{current_base_url}]: " if current_base_url else "Base URL: "
         )
-        url = input(url_prompt).strip()
+        url = line_input(url_prompt).strip()
     except (KeyboardInterrupt, EOFError):
         print()
         return
@@ -4462,7 +4493,7 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
             if current_model
             else "Model slug (optional): "
         )
-        model = input(model_prompt).strip()
+        model = line_input(model_prompt).strip()
     except (KeyboardInterrupt, EOFError):
         print()
         return
@@ -5668,58 +5699,14 @@ def cmd_import(args):
 
 
 def _print_version_info(*, check_updates: bool = True) -> None:
-    from hermes_cli.config import detect_install_method
-    from hermes_cli.slash_exec import CommandContext, execute_command
-
-    # Core version line is registry-owned (shared with the gateway /version);
-    # the install/python/SDK detail below is CLI-only decoration.
-    print(execute_command("version", CommandContext(surface="cli")).text)
-    print(f"Install directory: {PROJECT_ROOT}")
-    print(f"Install method: {detect_install_method(PROJECT_ROOT)}")
-
-    # Show Python version
-    print(f"Python: {sys.version.split()[0]}")
-
-    # Check for key dependencies.  Use importlib.metadata rather than
-    # ``import openai`` — the SDK drags in ~800ms of pydantic-backed type
-    # modules just to expose ``__version__``.  Metadata lookup is ~2ms.
-    try:
-        from importlib.metadata import version as _pkg_version, PackageNotFoundError
-
-        try:
-            print(f"OpenAI SDK: {_pkg_version('openai')}")
-        except PackageNotFoundError:
-            print("OpenAI SDK: Not installed")
-    except ImportError:
-        print("OpenAI SDK: Not installed")
-
-    if not check_updates:
-        return
-
-    # Show update status (synchronous — acceptable since user asked for version info)
-    try:
-        from hermes_cli.banner import UPDATE_AVAILABLE_NO_COUNT, check_for_updates
-        from hermes_cli.config import recommended_update_command
-
-        behind = check_for_updates()
-        if behind == UPDATE_AVAILABLE_NO_COUNT:
-            print(
-                f"Update available — run '{recommended_update_command()}'"
-            )
-        elif behind and behind > 0:
-            commits_word = "commit" if behind == 1 else "commits"
-            print(
-                f"Update available: {behind} {commits_word} behind — "
-                f"run '{recommended_update_command()}'"
-            )
-        elif behind == 0:
-            print("Up to date")
-    except Exception:
-        pass
+    # Single source of truth for version output — shared with the
+    # `hermes --version` pre-import fast path (the `version` subcommand
+    # was consolidated into `--version`).
+    _startup_fast.print_fast_version_info(check_updates=check_updates)
 
 
 def cmd_version(args):
-    """Show version."""
+    """Show version (--version/-V flag)."""
     _print_version_info(check_updates=True)
 
 
@@ -10166,7 +10153,6 @@ def _coalesce_session_name_args(argv: list) -> list:
         "mcp",
         "sessions",
         "insights",
-        "version",
         "update",
         "uninstall",
         "profile",
@@ -11015,7 +11001,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     print()
     try:
-        username = input("  Username [admin]: ").strip() or "admin"
+        username = line_input("  Username [admin]: ").strip() or "admin"
         password = getpass.getpass("  Password: ")
         confirm = getpass.getpass("  Confirm password: ")
     except (EOFError, KeyboardInterrupt):
@@ -11612,7 +11598,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "resume",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
-        "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "verify",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -11943,6 +11929,7 @@ def _try_fast_chat_launch() -> bool:
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
         )
 
@@ -11971,7 +11958,7 @@ def _try_termux_fast_cli_launch() -> bool:
         return False
 
     if _is_termux_fast_version_argv(argv):
-        _print_version_info(check_updates=False)
+        _print_version_info(check_updates=True)
         return True
 
     first = _first_positional_argv()
@@ -11989,7 +11976,7 @@ def _try_termux_fast_cli_launch() -> bool:
     args = parser.parse_args(_coalesce_session_name_args(argv))
 
     if getattr(args, "version", False):
-        _print_version_info(check_updates=False)
+        _print_version_info(check_updates=True)
         return True
 
     if getattr(args, "oneshot", None):
@@ -12000,6 +11987,7 @@ def _try_termux_fast_cli_launch() -> bool:
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
         )
 
@@ -12481,6 +12469,57 @@ def main():
     fallback_parser.set_defaults(func=cmd_fallback)
 
     # =========================================================================
+    # worktree command — audit/reclaim accumulated git worktrees + branches
+    # =========================================================================
+    worktree_parser = subparsers.add_parser(
+        "worktree",
+        help="Audit and reclaim accumulated git worktrees and merged branches",
+        description=(
+            "Attended reclaim for the .worktrees/ directory hermes -w sessions "
+            "accumulate. Never deletes uncommitted tracked changes, unique "
+            "unpushed commits, or in-use trees; untracked-only scratch is "
+            "archived to ~/.hermes/archive/worktree-prune/ before removal. See: "
+            "https://hermes-agent.nousresearch.com/docs/user-guide/cli#worktree-cleanup"
+        ),
+    )
+    worktree_subparsers = worktree_parser.add_subparsers(dest="worktree_action")
+    worktree_list = worktree_subparsers.add_parser(
+        "list",
+        aliases=["ls", "audit"],
+        help="Classify every tree: age, size, verdict, reason (default action)",
+    )
+    worktree_list.add_argument("--repo", help="Repo root (default: current repo)")
+    worktree_prune = worktree_subparsers.add_parser(
+        "prune",
+        help="Remove safe trees and delete fully-merged local branches",
+    )
+    worktree_prune.add_argument("--repo", help="Repo root (default: current repo)")
+    worktree_prune.add_argument(
+        "--dry-run", action="store_true",
+        help="Show the plan without changing anything",
+    )
+    worktree_prune.add_argument(
+        "--trees-only", action="store_true",
+        help="Only remove worktrees; leave local branches alone",
+    )
+    worktree_prune.add_argument(
+        "--branches-only", action="store_true",
+        help="Only delete merged local branches; leave worktrees alone",
+    )
+
+    def _dispatch_worktree(_args):
+        from hermes_cli.worktree_cmd import cmd_worktree
+
+        # argparse aliases set dest to the literal typed string ("ls"/"audit").
+        action = getattr(_args, "worktree_action", None)
+        if action in ("ls", "audit"):
+            _args.worktree_action = "list"
+        return cmd_worktree(_args)
+
+    worktree_parser.set_defaults(func=_dispatch_worktree)
+
+
+    # =========================================================================
     # secrets command — external secret managers (Bitwarden, 1Password)
     # =========================================================================
     secrets_parser = subparsers.add_parser(
@@ -12841,7 +12880,7 @@ def main():
     # own argparse tree.  No hardcoded plugin commands in main.py.
     #
     # Skipped when the invocation is already targeting a known built-in
-    # subcommand — ``hermes --help``, ``hermes version``, ``hermes logs``,
+    # subcommand — ``hermes --help``, ``hermes logs``,
     # etc.  This avoids eagerly importing every bundled plugin module
     # (google.cloud.pubsub_v1, aiohttp, grpc, PIL …) which costs
     # 500-650ms on typical installs.
@@ -13412,6 +13451,11 @@ def main():
         help="Also delete archived sessions (excluded by default)",
     )
     sessions_prune.add_argument(
+        "--include-pinned",
+        action="store_true",
+        help="Also delete pinned sessions (excluded by default — pin is a keep flag)",
+    )
+    sessions_prune.add_argument(
         "--never-active",
         action="store_true",
         help=(
@@ -13711,10 +13755,8 @@ def main():
     # =========================================================================
     build_claw_parser(subparsers, cmd_claw=cmd_claw)
 
-    # =========================================================================
-    # version command  (parser built in hermes_cli/subcommands/version.py)
-    # =========================================================================
-    build_version_parser(subparsers, cmd_version=cmd_version)
+    # NOTE: the `hermes version` subcommand was removed — `hermes --version`
+    # / `-V` now carries the full output including update status.
 
     # =========================================================================
     # update command  (parser built in hermes_cli/subcommands/update.py)
@@ -13878,6 +13920,7 @@ def main():
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
         )
 
